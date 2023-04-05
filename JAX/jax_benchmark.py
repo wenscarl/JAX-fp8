@@ -14,194 +14,36 @@ from flax import linen as nn
 import re
 from flax.traverse_util import flatten_dict, unflatten_dict
 import argparse
+import time
+
+import DenseFp8 as dense_fp8
 
 parser = argparse.ArgumentParser(description='config')
 parser.add_argument('--fp8', action='store_true', help='use_fp8')
-parser.add_argument('--train', action='store_true', help='train_with_state')
 parser.add_argument('--scale', type=int, help='model_scale', default=1)
-
 args = parser.parse_args()
 
 model_size_scale = args.scale
 use_fp8 = args.fp8
-is_train = args.train
 print("DEBUG: use_fp8", use_fp8)
 print("DEBUG: model_scale", model_size_scale)
-print("DEBUG: is_train", is_train)
-
-PRNGKey = Any
-Shape = Tuple[int, ...]
-Dtype = Any
-Array = Any
-ActivationFn = Any
-
-FAKE_E4M3 = jnp.float8_e4m3fn
-FAKE_E5M2 = jnp.float8_e5m2
-E4M3_MAX = 448
-E5M2_MAX = 57344
 
 # Type annotations
 Array = jnp.ndarray
 DType = jnp.dtype
 PRNGKey = jnp.ndarray
 Shape = Iterable[int]
-Activation = Callable[..., Array]
 # Parameter initializers.
 Initializer = Callable[[PRNGKey, Shape, DType], Array]
 
 def tree_shape(x): return jax.tree_map(lambda v: v.shape, x)
 
-def get_fp8_max(fake_dtype):
-  if fake_dtype == FAKE_E4M3:
-    return E4M3_MAX
-  elif fake_dtype == FAKE_E5M2:
-    return E5M2_MAX
-  else:
-    raise ValueError('Only FAKE_E4M3 and FAKE_E5M2 supported')
-
-def quantize(x, quantized_dtype, scale):
-  dtype_max = get_fp8_max(quantized_dtype)
-  scaled_x = jnp.clip(x / scale, -dtype_max, dtype_max)
-  return scaled_x.astype(quantized_dtype)
-
-def dequantize(x, wide_dtype, scale):
-  return x.astype(wide_dtype) * scale
-
-def quantize_dequantize(x, quantized_dtype, scale):
-  orig_dtype = x.dtype
-  qx = quantize(x, quantized_dtype, scale)
-  return dequantize(qx, orig_dtype, scale)
-
-def compute_new_scale(x, quantized_dtype, scale):
-  dtype_max = get_fp8_max(quantized_dtype)
-  amax = jnp.max(jnp.abs(x)).astype(scale.dtype)
-  # Ensure scale != 0 and avoid divide-by-zero.
-  amax = jnp.maximum(amax, 2**-10)
-  return 1.1 * amax / dtype_max
-
-def qdq_and_new_scale(x, dtype, scale):
-  qx = quantize_dequantize(x, dtype, scale)
-  new_scale = compute_new_scale(x, dtype, scale)
-  return qx, new_scale
-@jax.custom_vjp
-def kernel_qdq(kernel, kernel_scale):
-  qkernel, new_kernel_scale = qdq_and_new_scale(kernel, FAKE_E4M3, kernel_scale)
-  return qkernel, new_kernel_scale
-
-def kernel_qdq_fwd(kernel, kernel_scale):
-  return kernel_qdq(kernel, kernel_scale), None
-
-def kernel_qdq_bwd(_, g):
-  # pass through gradients
-  return g
-
-
-kernel_qdq.defvjp(kernel_qdq_fwd, kernel_qdq_bwd)
-
-
-@jax.custom_vjp
-def in_qdq(input, in_scale, in_grad_scale, dummy=None):
-  qin, new_in_scale = qdq_and_new_scale(input, FAKE_E4M3, in_scale)
-  # input_grad_scale is needed in vjp
-  return qin, new_in_scale, in_grad_scale
-
-def in_qdq_fwd(input, in_scale, in_grad_scale, dummy):
-  # new_in_grad_scale is a dummy value
-  qin, new_in_scale, new_in_grad_scale = in_qdq(
-      input, in_scale, in_grad_scale, dummy)
-  return (qin, new_in_scale, new_in_grad_scale), (in_grad_scale, )
-
-def in_qdq_bwd(res, g):
-  in_grad_scale, = res
-  qin_g, new_in_scale_g, in_grad_scale_g = g
-  in_grad, new_in_grad_scale = qdq_and_new_scale(
-      qin_g, FAKE_E5M2, in_grad_scale)
-  return in_grad, jnp.zeros_like(new_in_scale_g), jnp.zeros_like(
-      in_grad_scale_g), new_in_grad_scale
-
-
-in_qdq.defvjp(in_qdq_fwd, in_qdq_bwd)
-
-@jax.custom_vjp
-def out_qdq(out, out_scale, out_grad_scale, dummy=None):
-  # fwd do nothing
-  # out_grad_scale is needed in vjp
-  return out, out_scale, out_grad_scale
-
-def out_qdq_fwd(out, out_scale, out_grad_scale, dummy):
-  # new_out_grad_scale is a dummy value
-  qout, new_out_scale, new_out_grad_scale = out_qdq(
-      out, out_scale, out_grad_scale, dummy)
-  return (qout, new_out_scale, new_out_grad_scale), (out_grad_scale, )
-
-def out_qdq_bwd(res, g):
-  out_grad_scale, = res
-  qout_g, new_out_scale_g, out_grad_scale_g = g
-  out_grad, new_out_grad_scale = qdq_and_new_scale(
-      qout_g, FAKE_E5M2, out_grad_scale)
-  return out_grad, jnp.zeros_like(new_out_scale_g), jnp.zeros_like(
-      out_grad_scale_g), new_out_grad_scale
-
-out_qdq.defvjp(out_qdq_fwd, out_qdq_bwd)
-
-
-def initializer_32(): return jnp.array(32.0, dtype=jnp.float32)
-
-class DenseWithScaling(nn.Module):
-  features: int
-  param_dtype: Dtype = jnp.float32
-  kernel_init: Callable[[PRNGKey, Shape, Dtype],
-                        Array] = nn.initializers.lecun_normal()
-  bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.zeros
-  activation: Optional[ActivationFn] = None
-  use_quant: bool = False
-  use_bias: bool = False
-  is_last: bool = False
-
-  @nn.compact
-  def __call__(self, inputs):
-    kernel = self.param('kernel', self.kernel_init,
-                        (inputs.shape[-1], self.features), self.param_dtype)
-    bias = self.param(
-        'bias', self.bias_init, (self.features,),
-        self.param_dtype)
-
-    if self.use_quant:
-      kernel_scale = self.variable('qscale', 'kernel_scale', initializer_32)
-      kernel, new_kernel_scale = kernel_qdq(kernel, kernel_scale.value)
-      kernel_scale.value = new_kernel_scale
-
-      input_scale = self.variable('qscale', 'input_scale', initializer_32)
-      input_grad_scale = self.variable(
-          'qscale', 'input_grad_scale', initializer_32)
-      input_grad_scale_perturb = self.variable(
-          'grad_qscale_placeholder', 'input_grad_scale_placeholder', initializer_32)
-      # input_grad_scale is updated in training loop
-      inputs, new_input_scale, new_input_grad_scale = in_qdq(
-          inputs, input_scale.value, input_grad_scale.value,
-          input_grad_scale_perturb.value)
-      input_scale.value = new_input_scale
-
-
-    # Actual dense layer math.
-    out = jnp.dot(inputs, kernel)
-#    if self.use_bias:
-#        out = out + bias
-    if self.activation:
-      out = self.activation(out)
-
-#    if self.use_quant and self.is_last:
-#      output_scale = self.variable('qscale', 'output_scale', initializer_32)
-#      output_grad_scale = self.variable(
-#          'qscale', 'output_grad_scale', initializer_32)
-#      # output_grad_scale is updated in training loop
-#      output_grad_scale_perturb = self.variable(
-#          'grad_qscale_placeholder', 'output_grad_scale_placeholder', initializer_32)
-#      out, new_out_scale, new_out_grad_scale = out_qdq(
-#          out, output_scale.value, output_grad_scale.value,
-#          output_grad_scale_perturb.value)
-#      output_scale.value = new_out_scale
-    return out
+ext_kwargs = {}
+if use_fp8:
+  ext_kwargs['use_quant'] = True
+  DenseLayer = partial(dense_fp8.DenseWithScaling, **ext_kwargs)
+else:
+  DenseLayer = nn.DenseGeneral
 
 def _convert_to_activation_function(
         fn_or_string: Union[str, Callable]) -> Callable:
@@ -235,7 +77,6 @@ class MlpBlock(nn.Module):
   kernel_init: Initializer = nn.initializers.variance_scaling(
       1.0, 'fan_in', 'truncated_normal')
   dtype: Any = jnp.float32
-  use_quant: bool = True
 
   @nn.compact
   def __call__(self, inputs):
@@ -245,20 +86,18 @@ class MlpBlock(nn.Module):
     activations = []
     for idx, act_fn in enumerate(self.activations):
       dense_name = 'wi' if len(self.activations) == 1 else f'wi_{idx}'
-      x = DenseWithScaling(
+      x = DenseLayer(
           self.ffn_hidden_size,
           kernel_init=self.kernel_init,
-          name=dense_name)(
-              inputs)
+          name=dense_name)(inputs)
       x = _convert_to_activation_function(act_fn)(x)
       activations.append(x)
-#    x = DenseWithScaling(self.ffn_hidden_size,use_quant=self.use_quant)(inputs)
+#    x = DenseLayer(self.ffn_hidden_size,use_quant=self.use_quant)(inputs)
 
     # Take elementwise product of above intermediate activations.
     # Apply dropout and final dense output projection.
-    output = DenseWithScaling(
+    output = DenseLayer(
         self.hidden_size,
-        use_quant=self.use_quant,
         name='wo')(
             x)
     return output
@@ -342,36 +181,29 @@ class BasicTransformer(nn.Module):
 
     self.ln2 = nn.LayerNorm(epsilon=self.layernorm_eps)
     self.mlp = MlpBlock(hidden_size=self.hidden_size,
-                        ffn_hidden_size=self.ffn_hidden_size,use_quant=self.use_quant)
-    self.projection = DenseWithScaling(
-        self.hidden_size, use_quant=self.use_quant, is_last=True)
-    self.projection2 = DenseWithScaling(activation=jax.nn.relu,
-        features=3*self.hidden_size, use_quant=self.use_quant)
-
-    self.qkv_projection = DenseWithScaling(activation=jax.nn.relu,
-        features=3 * self.hidden_size, use_quant=self.use_quant)
+                        ffn_hidden_size=self.ffn_hidden_size)
+    self.projection = DenseLayer(
+        features=self.hidden_size)
+    self.qkv_projection = DenseLayer(#activation=jax.nn.relu,
+        features=3 * self.hidden_size)
 
   def __call__(self, inputs):
+    res = inputs
     x = self.ln1(inputs)
-    x = self.projection2(x)
+    qkv = self.qkv_projection(x)
+    qkv_shape = qkv.shape
+    new_shape = tuple([qkv_shape[0], qkv_shape[1], self.num_attention_heads,
+                      3 * self.hidden_size // self.num_attention_heads])
+    qkv = jnp.reshape(qkv, new_shape)
+    q, k, v = jnp.split(qkv, 3, axis=-1)
+    x = self.attention(q, k, v)
     x = self.projection(x)
-#    return x
-#    res = inputs
-#    x = self.ln1(inputs)
-#    qkv = self.qkv_projection(x)
-#    qkv_shape = qkv.shape
-#    new_shape = tuple([qkv_shape[0], qkv_shape[1], self.num_attention_heads,
-#                      3 * self.hidden_size // self.num_attention_heads])
-#    qkv = jnp.reshape(qkv, new_shape)
-#    q, k, v = jnp.split(qkv, 3, axis=-1)
-#    x = self.attention(q, k, v)
-#    x = self.projection(x)
-#    x = self.dropout(x)
-#    x = res + x
-#    res = x
-#    x = self.ln2(x)
-#    x = self.mlp(x)
-#    return x + res
+    x = self.dropout(x)
+    x = res + x
+    res = x
+    x = self.ln2(x)
+    x = self.mlp(x)
+    return x + res
 
 
 class TrainState(struct.PyTreeNode):
@@ -435,13 +267,13 @@ def step_fn(model, train_state, input_batch):
       opt_state=updated_opt_state), loss_val
 
 
-batch_size = 16
+batch_size = 4
 epochs = 50
 
-hidden_size = 512 * model_size_scale
-ffn_hidden_size = 256 * model_size_scale
-num_attention_heads = 8
-sequence_length = 128
+hidden_size = 4096 * model_size_scale
+ffn_hidden_size = 16384 * model_size_scale
+num_attention_heads = 32
+sequence_length = 2048
 dropout_rate = 0.0
 
 kdata = jax.random.PRNGKey(1001)
@@ -484,7 +316,7 @@ def run(use_quant: bool, tb_label: str):
       # For debugging only, otherwise it slows down training
       with summary_writer.as_default(step=step):
         if train_state.qscale:
-          # print(f'epoch={epoch_i}, step={i}, train_state.qscale={train_state.qscale}')
+          #print(f'epoch={epoch_i}, step={i}, train_state.qscale={train_state.qscale}')
           # Monitor quantization scales
           for k, v in flatten_dict(train_state.qscale).items():
             tf.summary.scalar('/'.join(k), v)
@@ -499,35 +331,6 @@ def run(use_quant: bool, tb_label: str):
       tf.summary.scalar('eval_loss', eval_loss)
     print(
         f'epoch={epoch_i}, step={i}, train_loss={train_loss}, eval_loss={eval_loss}')
-
-if not is_train:
-  def loss_ln1(model, params, x, y):
-    lo = model.apply(params, x)
-    return jnp.mean(optax.l2_loss(lo , y))
-  
-  
-  #@jax.jit
-  def update(model, params, x, y):
-    bound_loss_fn1 = partial(loss_ln1, model)  
-    gradient_fn = jax.value_and_grad(bound_loss_fn1, has_aux=False)
-    loss, grads = gradient_fn(params, x, y)
-    return loss, grads
-  
-  def myrun(use_quant=False):
-      root_k = jax.random.PRNGKey(123)
-      init_k, subk = jax.random.split(root_k)
-      model = BasicTransformer(
-        use_quant=use_quant, hidden_size=hidden_size,
-        ffn_hidden_size=ffn_hidden_size, num_attention_heads=num_attention_heads,
-        attention_dropout=dropout_rate, hidden_dropout=dropout_rate)
-      init_vars = model.init(init_k, x_train)
-      mmm = jax.jit(partial(update, model))
-      loss, grad = mmm( init_vars, x_train, y_train)
-      return loss, grad
-  
-  a, b = myrun()
-  print(a, b)
-else:
-  run(use_quant=use_fp8, tb_label='fp8')
-
-
+start = time.time()
+run(use_quant=use_fp8, tb_label='fp8')
+print("sec:", time.time()-start)

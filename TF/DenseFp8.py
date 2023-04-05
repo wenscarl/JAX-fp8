@@ -154,32 +154,32 @@ class DenseFp8(tf.keras.layers.Dense):
     def build(self, input_shape):
       super().build(input_shape)
 
-      # TODO(shuw): why 0.9?
-      init32 = tf.keras.initializers.Constant(1.)
+      init1 = tf.keras.initializers.Ones()
+      init0 = tf.keras.initializers.Zeros()
       self.input_amax_history = self.add_weight(
-          "input_amax_history", shape=(AMAX_HIS_LEN,), initializer=init32,
+          "input_amax_history", shape=(AMAX_HIS_LEN,), initializer=init0,
           trainable=False)
       self.input_scale = self.add_weight(
-          "input_scale", shape=(), initializer=init32, trainable=False)
+          "input_scale", shape=(), initializer=init1, trainable=False)
 
       self.kernel_amax_history = self.add_weight(
-          "kernel_amax_history", shape=(AMAX_HIS_LEN,), initializer=init32,
+          "kernel_amax_history", shape=(AMAX_HIS_LEN,), initializer=init0,
           trainable=False)
       self.kernel_scale = self.add_weight(
-          "kernel_scale", shape=(), initializer=init32, trainable=False)
+          "kernel_scale", shape=(), initializer=init1, trainable=False)
 
       self.input_grad_amax_history = self.add_weight(
           "input_grad_amax_history", shape=(AMAX_HIS_LEN,),
-          initializer=init32, trainable=False)
+          initializer=init0, trainable=False)
       self.input_grad_scale = self.add_weight(
-          "input_grad_scale", shape=(), initializer=init32, trainable=False)
+          "input_grad_scale", shape=(), initializer=init1, trainable=False)
 
       self.output_grad_amax_history = self.add_weight(
           "output_grad_amax_history", shape=(AMAX_HIS_LEN,),
-          initializer=init32, trainable=False)
+          initializer=init0, trainable=False)
       self.output_grad_scale = self.add_weight(
           "output_grad_scale", shape=(),
-          initializer=init32, trainable=False)
+          initializer=init1, trainable=False)
 
       self.built = True
 
@@ -190,10 +190,7 @@ class DenseFp8(tf.keras.layers.Dense):
                            self.input_amax_history)
 
       def grad(in_grad):
-        if self.input_from_keras_layer:
-            return in_grad
-        return qdq_and_update(in_grad, FAKE_E5M2, self.input_grad_scale,
-                              self.input_grad_amax_history)
+        return in_grad
 
       return qin, grad
 

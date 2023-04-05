@@ -30,8 +30,7 @@ if use_mixed:
   tf.keras.mixed_precision.set_global_policy('mixed_float16')
 ext_kwargs = {}
 if use_fp8:
-  pass
-#  ext_kwargs["is_last"] = True
+  ext_kwargs["is_last"] = True
 
 DenseLayer = dense_fp8.DenseFp8 if use_fp8 else layers.Dense
 
@@ -143,7 +142,6 @@ class BasicTransformer(tf.keras.Model):
 
     self.qkv_projection = DenseLayer(
         units=3 * hidden_size,
-        use_bias=True,
         **ext_kwargs,
     )
 
@@ -153,8 +151,9 @@ class BasicTransformer(tf.keras.Model):
         attention_dropout=attention_dropout,
     )
 
-    self.projection = DenseLayer(units=hidden_size, use_bias=False, **ext_kwargs)
-    self.projection2 = DenseLayer(units=3*hidden_size, use_bias=False, **ext_kwargs)
+    self.projection = DenseLayer(units=hidden_size, **ext_kwargs)
+
+#    self.projection2 = DenseLayer(units=3*hidden_size, **ext_kwargs)
 
     self.dropout = layers.Dropout(hidden_dropout)
     self.ln2 = layers.LayerNormalization(epsilon=layernorm_eps)
@@ -169,37 +168,37 @@ class BasicTransformer(tf.keras.Model):
       #      attention_mask: tf.Tensor,
   ) -> tf.Tensor:
 
-    x = self.ln1(x)
-    x = self.projection2(x)
-    x = self.projection(x)
-    return x
-#    res = x
 #    x = self.ln1(x)
-#
-#    # Fused QKV projection
-#    qkv = self.qkv_projection(x)
-#    qkv_shape = qkv.shape
-#    qkv = tf.reshape(
-#        qkv,
-#        shape=(
-#            qkv_shape[0],
-#            qkv_shape[1],
-#            self.num_attention_heads,
-#            3 * self.kv_channels,
-#        ),
-#    )
-#    q, k, v = tf.split(qkv, 3, axis=3)
-#
-#    attention_mask = None
-#    x = self.attention(q, k, v, attention_mask)
+#    x = self.projection2(x)
 #    x = self.projection(x)
-#    x = self.dropout(x)
-#    x = res + x
-#    res = x
-#    x = self.ln2(x)
-#    x = self.mlp(x)
-#
-#    return x + res
+#    return x
+    res = x
+    x = self.ln1(x)
+
+    # Fused QKV projection
+    qkv = self.qkv_projection(x)
+    qkv_shape = qkv.shape
+    qkv = tf.reshape(
+        qkv,
+        shape=(
+            qkv_shape[0],
+            qkv_shape[1],
+            self.num_attention_heads,
+            3 * self.kv_channels,
+        ),
+    )
+    q, k, v = tf.split(qkv, 3, axis=3)
+
+    attention_mask = None
+    x = self.attention(q, k, v, attention_mask)
+    x = self.projection(x)
+    x = self.dropout(x)
+    x = res + x
+    res = x
+    x = self.ln2(x)
+    x = self.mlp(x)
+
+    return x + res
 
 # Layer configuration
 hidden_size = 512 * model_size_scale
@@ -233,10 +232,10 @@ def speedometer(
 
   if is_train:
     def my_loss_fun(y1,y2):
-      sf = tf.square(y1-y2)
-      return tf.reduce_mean(sf)
+      squared_error = 0.5 * tf.square(y1 - y2)
+      return tf.reduce_mean(squared_error)
     model.compile(loss=my_loss_fun, optimizer=tf.keras.optimizers.SGD(learning_rate=0.01, momentum=0.1, jit_compile=True))
-    history = model.fit(x, y, batch_size=1, epochs=20,validation_split=0.0)
+    history = model.fit(x, y, batch_size=1, epochs=50, validation_split=0.0)
 
   else:
     @tf.function(jit_compile=True)
