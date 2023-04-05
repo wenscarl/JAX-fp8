@@ -29,8 +29,6 @@ print("DEBUG: model_scale", model_size_scale)
 if use_mixed:
   tf.keras.mixed_precision.set_global_policy('mixed_float16')
 ext_kwargs = {}
-if use_fp8:
-  ext_kwargs["is_last"] = True
 
 DenseLayer = dense_fp8.DenseFp8 if use_fp8 else layers.Dense
 
@@ -115,8 +113,8 @@ class BasicMLP(tf.keras.Model):
   ):
     super().__init__()
 
-    self.linear1 = DenseLayer(units=ffn_hidden_size, use_bias=True, **ext_kwargs)
-    self.linear2 = DenseLayer(units=hidden_size, use_bias=True, **ext_kwargs)
+    self.linear1 = DenseLayer(units=ffn_hidden_size)
+    self.linear2 = DenseLayer(units=hidden_size)
 
   def call(self, x: tf.Tensor) -> tf.Tensor:
     x = self.linear1(x)
@@ -201,14 +199,14 @@ class BasicTransformer(tf.keras.Model):
     return x + res
 
 # Layer configuration
-hidden_size = 512 * model_size_scale
-sequence_length = 128
-batch_size = 16
+hidden_size = 4096 * model_size_scale
+sequence_length = 2048
+batch_size = 4
 ffn_hidden_size = 16384 * model_size_scale
 num_attention_heads = 32
 dtype = tf.float16
 
-opt = tf.keras.optimizers.experimental.SGD(learning_rate=0.0000001)
+opt = tf.keras.optimizers.experimental.SGD(learning_rate=0.01, momentum=0.1)
 def speedometer(
     model: tf.keras.Model,
     x: tf.Tensor,
