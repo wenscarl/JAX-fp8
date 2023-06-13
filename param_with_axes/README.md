@@ -11,5 +11,5 @@ The runtime is compared as followed(read from nsight system).
 
 | how is it defined   |    time/step(ms)   |
 |:-------------:|------:|
-| `param_with_axes` |  21.62|
-| `nn.Module.param` |  15.38 |
+| `param_with_axes` |  44.3|
+| `nn.Module.param` |  33.9 |
