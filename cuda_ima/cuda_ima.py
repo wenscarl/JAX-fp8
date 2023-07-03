@@ -7,6 +7,7 @@ from absl.testing import absltest
 from functools import partial
 import re
 
+import argparse
 import optax
 import os
 
@@ -36,6 +37,13 @@ from typing import (Any, Callable, Iterable, List, Optional, Mapping, Sequence, 
 from typing import Callable, Iterable, Optional, Dict, Union, Any, Tuple
 from flax.linen import partitioning as nn_partitioning
 
+
+parser = argparse.ArgumentParser(description='Benchmark a basic encoder layer')
+parser.add_argument('--d', type=int, help='matrix dim')
+args = parser.parse_args()
+
+dim = args.d
+
 param_with_axes = nn_partitioning.param_with_axes
 with_sharding_constraint = nn_partitioning.with_sharding_constraint
 
@@ -48,6 +56,7 @@ FAKE_E4M3 = jnp.float8_e4m3fn
 FAKE_E5M2 = jnp.float8_e5m2
 E4M3_MAX = 448
 E5M2_MAX = 57344
+
 
 def get_fp8_max(fake_dtype):
   if fake_dtype == FAKE_E4M3:
@@ -134,13 +143,13 @@ class DenseGeneral(nn.Module):
 
 def run():
   rules = (('batch', 'data'),)
-  device_mesh = mesh_utils.create_device_mesh((4, 2))
+  device_mesh = mesh_utils.create_device_mesh((2, 1))
   mesh = Mesh(devices=device_mesh, axis_names=('data', 'model'))
   
-  model = DenseGeneral(4096, kernel_axes=('hidden', 'mlp'))
+  model = DenseGeneral(dim, kernel_axes=('hidden', 'mlp'))
   
-  x = random.normal(random.PRNGKey(0), (4096, 4096))
-  dy = random.normal(random.PRNGKey(0), (4096, 4096))
+  x = random.normal(random.PRNGKey(0), (dim, dim))
+  dy = random.normal(random.PRNGKey(0), (dim, dim))
   k = random.PRNGKey(0)
   
   spmd.set_logical_axis_rules(rules)
@@ -161,8 +170,6 @@ def run():
   
   with mesh:
     loss, grads = pjit_step_fn(initialized_state, x,dy)
-#    lowered = pjit_step_fn.lower(initialized_state, x, dy)
-#  hlo = lowered.compile()  
   return loss, grads
 
 print(run())
