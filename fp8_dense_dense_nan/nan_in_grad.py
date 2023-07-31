@@ -234,4 +234,6 @@ def run():
   g_w = grads[0]['params']['dense']['kernel']
   jax.debug.print('grad of non-fp8 dense kernel:\nmax: {}\nmin: {}\nabs_max:{}\nabs_min: {}', jnp.max(g_w), jnp.min(g_w), jnp.max(jnp.abs(g_w)), jnp.min(jnp.abs(g_w)))
 
+# python nan_in_grad.py --fp8 --mixed # nan
+# XLA_FLAGS="--xla_gpu_simplify_all_fp_conversions=false" python nan_in_grad.py --fp8 --mixed # good
 run()
