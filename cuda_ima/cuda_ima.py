@@ -46,6 +46,7 @@ dim = args.d
 
 param_with_axes = nn_partitioning.param_with_axes
 with_sharding_constraint = nn_partitioning.with_sharding_constraint
+variable_with_axes = nn_partitioning.variable_with_axes
 
 Array = jnp.ndarray
 Dtype = jnp.dtype
@@ -124,38 +125,64 @@ class DenseGeneral(nn.Module):
   @nn.compact
   def __call__(self, inputs):
 
-    
+
     kernel = param_with_axes(
         'kernel',
         self.kernel_init,
         (inputs.shape[1], self.features),
         self.param_dtype,
         axes=self.kernel_axes)
+    scale_args = (
+        nn.initializers.ones_init(),
+        random.PRNGKey(0),
+        (1,),
+        jnp.float32,
+    )
 
-    output_grad_scale = jnp.full((1,), 1.01)
-    inputs_scale = jnp.full((1,), 0.99)
+    input_scale = variable_with_axes(
+        'fp8_params',
+        'input_scale',
+        *scale_args,
+        axes=('fp8_meta',))
+    kernel_scale = variable_with_axes(
+        'fp8_params',
+        'kernel_scale',
+        *scale_args,
+        axes=('fp8_meta',))
+    output_grad_scale = variable_with_axes(
+        'fp8_params',
+        'output_grad_scale',
+        *scale_args,
+        axes=('fp8_meta',))
 
-    inputs = input_qdq(inputs, inputs_scale)
+
+
+    inputs = input_qdq(inputs, input_scale.value)
+    kernel = input_qdq(kernel, kernel_scale.value)
     out = jnp.dot(inputs, kernel)
-    out = out_qdq(out, output_grad_scale)
+    out = out_qdq(out, output_grad_scale.value)
 
     return out
 
 def run():
-  rules = (('batch', 'data'),)
-  device_mesh = mesh_utils.create_device_mesh((2, 1))
+  rules = (('batch', 'data'),
+             ('embed', 'model'),
+             ('hidden', 'data'),
+             ('mlp', 'model'))
+
+  device_mesh = mesh_utils.create_device_mesh((4, 2))
   mesh = Mesh(devices=device_mesh, axis_names=('data', 'model'))
-  
+
   model = DenseGeneral(dim, kernel_axes=('hidden', 'mlp'))
-  
+
   x = random.normal(random.PRNGKey(0), (dim, dim))
   dy = random.normal(random.PRNGKey(0), (dim, dim))
   k = random.PRNGKey(0)
-  
+
   spmd.set_logical_axis_rules(rules)
-  
+
   initialized_state = model.init(k, x)
-  
+
   def loss_fn(state, x, dy):
     x = spmd.with_logical_constraint(x, ('batch', 'embed'))
     dy = spmd.with_logical_constraint(dy, ('batch', 'mlp'))
@@ -163,11 +190,11 @@ def run():
     y = model.apply(state, x)
     loss = y * dy.astype(y.dtype)
     return jnp.sum(loss)
-  
+
   pjit_step_fn = pjit(
       jax.value_and_grad(loss_fn, argnums=[0, 1]),
   )
-  
+
   with mesh:
     loss, grads = pjit_step_fn(initialized_state, x,dy)
   return loss, grads
